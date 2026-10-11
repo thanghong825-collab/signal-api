@@ -1,10 +1,12 @@
 # ---------- part24: v2.11.0 - shadow rules and early checks: learn faster, compare other rules on the same tokens ----------
 # Loads before part7 (MCP). Every new verdict also stores what five alternative rules would have said, and is judged
 # again after 1h and 6h (same definition of a bad outcome) besides the usual 24h. Live answers are not changed.
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 app.version = VERSION
 app.openapi_schema = None
 
+DATASET_ENABLED = (os.getenv("DATASET_ENABLED") or "true").lower() in ("1", "true", "yes")
+DATASET_MAX = max(100, int(os.getenv("DATASET_MAX") or "2000"))  # labelled rows kept in Redis (about 1 KB each)
 SHADOW_ENABLED = (os.getenv("SHADOW_ENABLED") or "true").lower() in ("1", "true", "yes")
 
 
@@ -74,6 +76,71 @@ def _early_zadds(pid: str, now: int) -> list:
     return [["ZADD", zset, now + hours * 3600, pid] for hours, zset in _EARLY]
 
 
+_FEAT_SKIP = {"token", "name", "summary", "mint", "decision", "flags", "data_quality", "verdict_reasons", "suggested_next",
+              "disclaimer", "note", "verdict", "raw", "price_usd", "risk_score", "liquidity_usd"}
+_FEAT_NESTED = ("price_change_pct", "volume", "txns", "security", "holder_quality", "market", "holders", "buys", "sells")
+
+
+def _feat_scalar(v: Any) -> Any:
+    """A number, or a short enum-like word. Anything else (free text, names) is dropped on purpose."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return round(float(v), 4) if math.isfinite(float(v)) else None
+    if isinstance(v, str):
+        try:
+            f = float(v)
+            return round(f, 6) if math.isfinite(f) else None
+        except ValueError:
+            return v if re.fullmatch(r"[A-Za-z0-9_.-]{1,16}", v) else None
+    return None
+
+
+def _feat_str(r: dict) -> str:
+    """The numbers behind one verdict, as compact JSON, for the labelled dataset. Never raises, never keeps token names or text."""
+    if not DATASET_ENABLED:
+        return ""
+    try:
+        out: Dict[str, Any] = {}
+        for k, v in r.items():
+            if k in _FEAT_SKIP or not re.fullmatch(r"[a-z0-9_]{1,40}", str(k)):
+                continue
+            if isinstance(v, dict) and k in _FEAT_NESTED:
+                for k2, v2 in v.items():
+                    if re.fullmatch(r"[A-Za-z0-9_]{1,30}", str(k2)) and (x := _feat_scalar(v2)) is not None:
+                        out[f"{k}.{k2}"] = x
+            elif (x := _feat_scalar(v)) is not None and not isinstance(v, (dict, list)):
+                out[k] = x
+        for k in ("price_usd", "risk_score", "liquidity_usd"):  # the three core numbers, always as numbers
+            if (x := _feat_scalar(r.get(k))) is not None:
+                out[k] = x
+        text = json.dumps(out, separators=(",", ":"), sort_keys=True)
+        return text if len(text) <= 1800 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _num(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dataset_cmds(d: dict, v: str, src: str, ret: float, liq_ratio: float, bad: bool) -> list:
+    """One labelled row per judged verdict: no mint, no token name, only numbers and our own labels."""
+    if not DATASET_ENABLED:
+        return []
+    try:
+        row = {"ts": int(d.get("ts") or 0), "src": src, "verdict": v, "risk": float(d.get("score") or 0),
+               "flags": [f for f in (d.get("flags") or "").split(",") if f][:30], "shadow": d.get("shadow") or "",
+               "feat": json.loads(d.get("feat") or "{}"), "ret_h1": _num(d.get("ret_h1")), "ret_h6": _num(d.get("ret_h6")),
+               "ret_24h": round(ret, 2), "liq_ratio": round(liq_ratio, 3), "bad": 1 if bad else 0}
+        return [["LPUSH", "ds:rows", json.dumps(row, separators=(",", ":"))], ["LTRIM", "ds:rows", 0, DATASET_MAX - 1]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def record_prediction(client: httpx.AsyncClient, r: dict):
     """Store one verdict to be judged later. Skips major assets, one per mint per 24h, MAX_PRED_PER_DAY per day.
     (v2.11: also stores what the shadow rules would have said and schedules the 1h / 6h checks)"""
@@ -96,10 +163,11 @@ async def record_prediction(client: httpx.AsyncClient, r: dict):
         sol = await sol_price(client)
         src = _pred_source(mint)
         shadow_str = _shadow_str(r)
+        feat_str = _feat_str(r)
         await redis_pipe(client, [
             ["HSET", f"pred:{pid}", "mint", mint, "token", r.get("token") or "", "ts", now, "price", price,
              "liq", r.get("liquidity_usd") or 0, "verdict", r["verdict"], "conf", r["verdict_confidence"],
-             "score", r["risk_score"], "flags", ",".join(r.get("flags") or []), "sol", sol or "", "src", src, "shadow", shadow_str],
+             "score", r["risk_score"], "flags", ",".join(r.get("flags") or []), "sol", sol or "", "src", src, "shadow", shadow_str, "feat", feat_str],
             ["EXPIRE", f"pred:{pid}", PRED_HORIZON_S * 4],
             ["ZADD", "due", now + PRED_HORIZON_S, pid],
         ] + _early_zadds(pid, now))
@@ -197,6 +265,7 @@ async def resolve_due(client: httpx.AsyncClient) -> int:
                                   "return_pct": round(ret, 1), "sol_return_pct": round(sol_ret, 1) if sol_ret is not None else None,
                                   "excess_return_pct": round(xret, 1) if xret is not None else None,
                                   "bad_outcome": bad, "age_h": round(age / 3600, 1), "src": src}))
+        cmds += _dataset_cmds(d, v, src, ret, liq_ratio, bad)  # v2.11.1: labelled row for later analysis
     for item in recent:
         cmds.append(["LPUSH", "recent", item])
     if recent:
@@ -269,6 +338,8 @@ async def _resolve_early_one(client: httpx.AsyncClient, hours: int, zset: str) -
             if bad:
                 cmds.append(["HINCRBY", "sth", f"{pre}:{g}:bad", 1])
         cmds.append(["HINCRBYFLOAT", "sth", f"{pre}:v:{v}:ret", round(ret, 2)])
+        if DATASET_ENABLED:
+            cmds.append(["HSET", f"pred:{pid}", f"ret_h{hours}", str(round(ret, 2))])  # the hash is still alive: it is kept until 24h
     if cmds:
         await redis_pipe(client, cmds)
     return len(ids)
